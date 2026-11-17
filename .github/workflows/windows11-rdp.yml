@@ -1,0 +1,228 @@
+
+name: Windows 11 Tailscale RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-11-rdp:
+    runs-on: windows-11-arm
+    timeout-minutes: 350
+
+    steps:
+
+      # 1. Verify Windows 11
+      - name: Verify Windows 11
+        shell: pwsh
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+
+          Write-Host "Operating System: $($os.Caption)"
+          Write-Host "Version: $($os.Version)"
+          Write-Host "Architecture: $env:PROCESSOR_ARCHITECTURE"
+
+          if ($os.Caption -notmatch "Windows 11") {
+              throw "Windows 11 runner unavailable."
+          }
+
+      # 2. Connect to Tailscale
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      # 3. Configure RDP and create temporary user
+      - name: Configure Remote Desktop
+        shell: pwsh
+        env:
+          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+
+        run: |
+
+          $username = $env:RDP_USERNAME
+          $password = $env:RDP_PASSWORD
+
+          if ([string]::IsNullOrWhiteSpace($username)) {
+              throw "RDP_USERNAME secret is missing."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($password)) {
+              throw "RDP_PASSWORD secret is missing."
+          }
+
+          if ($username -notmatch '^[A-Za-z0-9_.-]{3,20}$') {
+              throw "Invalid local username."
+          }
+
+          # Enable Remote Desktop
+          $tsPath = "HKLM:\System\CurrentControlSet\Control\Terminal Server"
+
+          Set-ItemProperty `
+            -Path $tsPath `
+            -Name fDenyTSConnections `
+            -Value 0
+
+          # Keep Network Level Authentication enabled
+          $rdpPath = "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+
+          Set-ItemProperty `
+            -Path $rdpPath `
+            -Name UserAuthentication `
+            -Value 1
+
+          Set-ItemProperty `
+            -Path $rdpPath `
+            -Name SecurityLayer `
+            -Value 2
+
+          Set-ItemProperty `
+            -Path $rdpPath `
+            -Name MinEncryptionLevel `
+            -Value 3
+
+          # Create temporary local RDP account
+          $securePassword = ConvertTo-SecureString `
+            $password -AsPlainText -Force
+
+          $existing = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $existing) {
+
+              New-LocalUser `
+                -Name $username `
+                -Password $securePassword `
+                -Description "Temporary RDP account"
+
+          }
+          else {
+
+              Set-LocalUser `
+                -Name $username `
+                -Password $securePassword
+          }
+
+          # Standard RDP access, without administrator privileges
+          $member = Get-LocalGroupMember `
+            -Group "Remote Desktop Users"
+
+          if (-not ($member | Where-Object {
+              $_.Name -match "\\$([regex]::Escape($username))$"
+          })) {
+              Add-LocalGroupMember `
+                -Group "Remote Desktop Users" `
+                -Member $username
+          }
+
+          # Configure firewall
+          Get-NetFirewallRule `
+            -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName "Tailscale RDP Only" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Action Allow `
+            -Profile Any
+
+          # Start RDP service
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Write-Host "RDP configuration completed."
+
+      # 4. Verify Tailscale IP
+      - name: Get Tailscale Address
+        shell: pwsh
+        run: |
+
+          $ip = $null
+
+          for ($i = 0; $i -lt 30; $i++) {
+
+              $ip = (tailscale ip -4 | Select-Object -First 1).Trim()
+
+              if ($ip) {
+                  break
+              }
+
+              Start-Sleep -Seconds 3
+          }
+
+          if (-not $ip) {
+              throw "Tailscale IP unavailable."
+          }
+
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+          Write-Host "Tailscale IP: $ip"
+
+      # 5. Verify RDP listener
+      - name: Verify RDP
+        shell: pwsh
+        run: |
+
+          $listener = $null
+
+          for ($i = 0; $i -lt 30; $i++) {
+
+              $listener = Get-NetTCPConnection `
+                -LocalPort 3389 `
+                -State Listen `
+                -ErrorAction SilentlyContinue
+
+              if ($listener) {
+                  break
+              }
+
+              Start-Sleep -Seconds 2
+          }
+
+          if (-not $listener) {
+              throw "RDP listener failed to start."
+          }
+
+          Write-Host "RDP listener is active."
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Port: 3389"
+
+      # 6. Display connection information
+      - name: RDP Connection Information
+        shell: pwsh
+        env:
+          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+
+        run: |
+
+          Write-Host ""
+          Write-Host "================================"
+          Write-Host "       WINDOWS 11 RDP"
+          Write-Host "================================"
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Port: 3389"
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "Password: Stored securely"
+          Write-Host "================================"
+
+      # 7. Keep the machine running
+      - name: Maintain RDP Session
+        shell: pwsh
+        run: |
+
+          Write-Host "Windows 11 RDP is ready."
+
+          while ($true) {
+
+              Write-Host "RDP Active: $(Get-Date)"
+
+              Start-Sleep -Seconds 300
+          }
